@@ -1,0 +1,73 @@
+name: winget-auto-update
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Fetch live version
+        run: curl -fsS https://screenrhythm.com/version.json -o live-version.json
+
+      - name: Decide
+        id: decide
+        run: |
+          LIVE=$(python3 -c "import json;print(json.load(open('live-version.json'))['version'])")
+          LAST=$(cat state/last-version.txt 2>/dev/null || echo none)
+          echo "live=$LIVE" >> "$GITHUB_OUTPUT"
+          if [ "$LIVE" = "$LAST" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate manifests
+        if: steps.decide.outputs.changed == 'true'
+        run: python3 .github/scripts/make_manifests.py "${{ steps.decide.outputs.live }}" live-version.json out/
+
+      - name: Fork, commit and open PR
+        if: steps.decide.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          VERSION: ${{ steps.decide.outputs.live }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          gh api -X POST repos/microsoft/winget-pkgs/forks -f default_branch_only=true >/dev/null 2>&1 || true
+          sleep 15
+          git config --global user.name "screenrhythm-winget-bot"
+          git config --global user.email "bot@users.noreply.github.com"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/winget-pkgs.git" fork
+          cd fork
+          BR="screenrhythm-${VERSION}"
+          git checkout -B "$BR"
+          DEST="manifests/s/S/ScreenRhythm.ScreenRhythm/${VERSION}"
+          mkdir -p "$DEST"
+          cp ../out/*.yaml "$DEST/"
+          git add .
+          git commit -m "Add ScreenRhythm.ScreenRhythm version ${VERSION}"
+          git push --force origin "$BR"
+          gh pr create --repo microsoft/winget-pkgs \
+            --head "${OWNER}:${BR}" \
+            --title "New version: ScreenRhythm.ScreenRhythm ${VERSION}" \
+            --body-file ../.github/pr-body.md || echo "PR exists or creation failed; check manually"
+
+      - name: Mark processed
+        if: steps.decide.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.decide.outputs.live }}" > state/last-version.txt
+          git config user.name "screenrhythm-winget-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/last-version.txt
+          git commit -m "state: processed ${{ steps.decide.outputs.live }}"
+          git push
